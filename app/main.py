@@ -1,55 +1,94 @@
-from fastapi import FastAPI, Request, Form
-from fastapi.responses import RedirectResponse, HTMLResponse
+from __future__ import annotations
+
+from datetime import date, timedelta
+
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select, desc
-from .db import SessionLocal, engine, Base
-from .models import Record
+from sqlalchemy.exc import IntegrityError
+
+from .db import Base, engine, SessionLocal
+from .models import HabitLog
 
 app = FastAPI()
 templates = Jinja2Templates(directory="app/templates")
 
-# 起動時にテーブル作成（最小運用ならこれでOK）
+# 最小運用：起動時にテーブル作成
 Base.metadata.create_all(bind=engine)
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+HABITS = ["英作文", "運動", "瞑想"]
+
+
+def today() -> date:
+    return date.today()
+
+
+def last_n_days(n: int) -> list[date]:
+    t = today()
+    return [t - timedelta(days=i) for i in range(n)]
+
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
-    with SessionLocal() as db:
-        records = db.execute(select(Record).order_by(desc(Record.created_at)).limit(10)).scalars().all()
-    return templates.TemplateResponse("index.html", {"request": request, "records": records})
+    days = list(reversed(last_n_days(7)))  # 古い→新しいで表示
+    t = today()
 
-@app.get("/all", response_class=HTMLResponse)
-def all_records(request: Request):
     with SessionLocal() as db:
-        records = db.execute(select(Record).order_by(desc(Record.created_at))).scalars().all()
-    return templates.TemplateResponse("all.html", {"request": request, "records": records})
+        logs = db.execute(
+            select(HabitLog)
+            .where(HabitLog.log_date.in_(days), HabitLog.habit.in_(HABITS))
+            .order_by(desc(HabitLog.log_date), HabitLog.habit)
+        ).scalars().all()
 
-@app.post("/records")
-def create_record(
-    note: str = Form(...),
-    mood: str | None = Form(None),
+    # (date, habit) -> done の辞書にしてテンプレで参照しやすくする
+    status: dict[str, bool] = {}
+    for l in logs:
+        status[f"{l.log_date.isoformat()}::{l.habit}"] = l.done
+
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": request,
+            "habits": HABITS,
+            "days": days,
+            "today": t,
+            "status": status,
+        },
+    )
+
+
+@app.post("/log")
+def log_habit(
+    habit: str = Form(...),
+    done: str = Form(...),  # "yes" or "no"
 ):
-    note = note.strip()
-    if not note:
-        return RedirectResponse(url="/?error=empty", status_code=303)
+    if habit not in HABITS:
+        return RedirectResponse(url="/?error=bad_habit", status_code=303)
 
-    mood_int = None
-    if mood and mood.strip():
-        try:
-            m = int(mood)
-            if 1 <= m <= 5:
-                mood_int = m
-        except ValueError:
-            mood_int = None
+    done_bool = True if done == "yes" else False
+    t = today()
 
     with SessionLocal() as db:
-        db.add(Record(note=note, mood=mood_int))
-        db.commit()
+        # まず既存を探して上書き（Upsert風）
+        existing = db.execute(
+            select(HabitLog).where(HabitLog.log_date == t, HabitLog.habit == habit)
+        ).scalar_one_or_none()
+
+        if existing:
+            existing.done = done_bool
+            db.commit()
+        else:
+            db.add(HabitLog(log_date=t, habit=habit, done=done_bool))
+            try:
+                db.commit()
+            except IntegrityError:
+                # 競合した場合の保険：再取得して上書き
+                db.rollback()
+                existing = db.execute(
+                    select(HabitLog).where(HabitLog.log_date == t, HabitLog.habit == habit)
+                ).scalar_one()
+                existing.done = done_bool
+                db.commit()
 
     return RedirectResponse(url="/", status_code=303)
